@@ -113,3 +113,21 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Datasets & Large Binary Files (over 400,000 .npy files)
+Data/
+Data_normalized/
+**/Data/
+**/Data_normalized/
+*.npy
+*.mp4
+*.avi
+*.mkv
+tmp_clips/
+**/tmp_clips/
+
+# Execution and run logs
+*.log
+normalize_run.log
+run_collect_test.py
+
