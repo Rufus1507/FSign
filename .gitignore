@@ -114,12 +114,9 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-# Datasets & Large Binary Files (over 400,000 .npy files)
-Data/
+# Datasets & Large Binary Files
 Data_normalized/
-**/Data/
 **/Data_normalized/
-*.npy
 *.mp4
 *.avi
 *.mkv
