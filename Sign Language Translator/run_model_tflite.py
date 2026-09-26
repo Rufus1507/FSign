@@ -1,48 +1,67 @@
+# -*- coding: utf-8 -*-
+"""
+run_model_tflite.py — Nhận diện cử chỉ thời gian thực FSign sử dụng TFLite Engine (Mục C2)
+========================================================================================
+File này độc lập hoàn toàn với RunModel.py (dùng mô hình Keras .h5 gốc).
+Mục đích:
+  - Tích hợp mô hình Models/model_normalized_v1.tflite với TFLite Interpreter (XNNPACK).
+  - Giữ nguyên 100% logic nghiệp vụ đã xác minh từ GĐ B (B1-B5):
+      + B1: Chuẩn hóa per-hand (normalize_keypoints).
+      + B2: Idle Detection theo thời gian thực (IDLE_TIME_THRESHOLD_SEC = 0.5s).
+      + B3: Sửa lỗi consensus check (toàn bộ 10 frame gần nhất cùng nhãn và vượt threshold).
+      + B4: Cooldown thời gian thực (COOLDOWN_TIME_SEC = 1.2s).
+      + B5: Xử lý dropout (không append frame rỗng khi mất dấu tay ngắn).
+  - Bổ sung telemetry đo đếm thời gian từng khâu (cap.read, MediaPipe, normalize, TFLite predict, draw UI).
+  - Hiển thị trực quan FPS và độ trễ suy luận TFLite ngay trên màn hình.
+"""
+import os
+import sys
+import time
+from collections import deque
 import cv2
 import numpy as np
-import os
-import time
-import threading
-from collections import deque
-from matplotlib import pyplot as plt
 import mediapipe as mp
 import tensorflow as tf
-from model_def import build_model
-from preprocessing import normalize_keypoints
 
-# Cấu hình thời gian thực
-IDLE_TIME_THRESHOLD_SEC = 0.5  # Ngưỡng thời gian không thấy tay (giây) để coi là Idle
-CONSENSUS_WINDOW = 10          # Số frame liên tiếp cần đồng thuận cùng 1 nhãn (Mục B3)
-COOLDOWN_TIME_SEC = 1.2        # Thời gian cooldown giữa 2 lần chèn từ vào câu (Mục B4)
+# Fix Windows console UTF-8 output
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 # Chuyển working directory về thư mục chứa file script
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(SCRIPT_DIR)
+sys.path.insert(0, SCRIPT_DIR)
 
-# Khởi tạo mô hình MediaPipe Holistic
+from preprocessing import normalize_keypoints
+from RunModel import load_actions
+
+# Cấu hình thời gian thực (đồng bộ chuẩn với RunModel.py)
+IDLE_TIME_THRESHOLD_SEC = 0.5  # Ngưỡng thời gian không thấy tay (giây) để kích hoạt Idle
+CONSENSUS_WINDOW = 10          # Số frame liên tiếp cần đồng thuận cùng 1 nhãn (Mục B3)
+COOLDOWN_TIME_SEC = 1.2        # Thời gian cooldown giữa 2 lần chèn từ vào câu (Mục B4)
+SEQUENCE_LENGTH = 60           # Độ dài chuỗi cử chỉ đầu vào (60 frames)
+CONFIDENCE_THRESHOLD = 0.5     # Ngưỡng xác suất tối thiểu để chấp nhận nhận diện
+
+# Khởi tạo MediaPipe Holistic
 mp_hands = mp.solutions.holistic
 mp_drawing = mp.solutions.drawing_utils
 
 def mediapipe_detection(image, model):
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) # Chuyển đổi màu BGR sang RGB
-    image.flags.writeable = False                  # Tối ưu xử lý ảnh
-    results = model.process(image)                 # Dự đoán landmark
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image.flags.writeable = False
+    results = model.process(image)
     image.flags.writeable = True
-    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR) # Chuyển lại màu BGR
+    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
     return image, results
 
-def draw_landmarks(image, results):
-    mp_drawing.draw_landmarks(image, results.left_hand_landmarks, mp_hands.HAND_CONNECTIONS)
-    mp_drawing.draw_landmarks(image, results.right_hand_landmarks, mp_hands.HAND_CONNECTIONS)
-
 def draw_styled_landmarks(image, results):
-    # Vẽ bàn tay trái
     mp_drawing.draw_landmarks(
         image, results.left_hand_landmarks, mp_hands.HAND_CONNECTIONS,
         mp_drawing.DrawingSpec(color=(121, 22, 76), thickness=2, circle_radius=4),
         mp_drawing.DrawingSpec(color=(121, 44, 250), thickness=2, circle_radius=2)
     )
-    # Vẽ bàn tay phải
     mp_drawing.draw_landmarks(
         image, results.right_hand_landmarks, mp_hands.HAND_CONNECTIONS,
         mp_drawing.DrawingSpec(color=(245, 117, 66), thickness=2, circle_radius=4),
@@ -54,23 +73,39 @@ def extract_keypoints(results):
     rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark]).flatten() if results.right_hand_landmarks else np.zeros(21*3)
     return np.concatenate([lh, rh])
 
-def load_actions(cache_path=os.path.join('Data_normalized', 'dataset_cache.npz'), data_dir='Data_normalized'):
+class TFLiteModelWrapper:
     """
-    Lấy danh sách 61 nhãn chuẩn đúng thứ tự index lúc train:
-    1. Đọc trực tiếp từ dataset_cache.npz (label_map) để đảm bảo 100% khớp index.
-    2. Fallback duyệt Data_normalized nếu chưa có file cache.
+    Wrapper đóng gói TFLite Interpreter để cung cấp giao diện .predict()
+    tương thích hoàn toàn với tf.keras.Model mà không cần sửa đổi FSignRealtimeProcessor.
     """
-    if os.path.exists(cache_path):
-        c = np.load(cache_path, allow_pickle=True)
-        label_map = c['label_map'].item()
-        return np.array([k for k, v in sorted(label_map.items(), key=lambda x: x[1])])
-    elif os.path.exists(data_dir):
-        return np.array(sorted([d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))]))
-    else:
-        raise FileNotFoundError(f"Không tìm thấy nguồn dữ liệu nhãn tại {cache_path} hoặc {data_dir}")
+    def __init__(self, model_path, num_threads=4):
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"[LỖI] Không tìm thấy file mô hình TFLite tại: {model_path}.\nHãy chạy 'python convert_and_benchmark_tflite.py' trước để xuất mô hình!")
+        
+        self.model_path = model_path
+        self.num_threads = num_threads
+        print(f"=> Khởi tạo TFLite Interpreter từ: {model_path} (threads={num_threads})...")
+        self.interpreter = tf.lite.Interpreter(model_path=model_path, num_threads=num_threads)
+        self.interpreter.allocate_tensors()
 
-# Danh sách 61 câu cử chỉ nhận diện chuẩn từ dataset
-actions = load_actions()
+        self.input_details = self.interpreter.get_input_details()
+        self.output_details = self.interpreter.get_output_details()
+        self.in_idx = self.input_details[0]['index']
+        self.out_idx = self.output_details[0]['index']
+        print(f"   Input shape:  {self.input_details[0]['shape']} | Type: {self.input_details[0]['dtype']}")
+        print(f"   Output shape: {self.output_details[0]['shape']} | Type: {self.output_details[0]['dtype']}")
+        print(f"=> TFLite Interpreter sẵn sàng!")
+
+    def predict(self, input_data: np.ndarray, verbose=0) -> np.ndarray:
+        """
+        Thực thi suy luận 1 mẫu (hoặc batch) bằng TFLite Interpreter.
+        Đầu vào: array shape (1, 60, 126)
+        Đầu ra: array shape (1, 61)
+        """
+        data = np.asarray(input_data, dtype=np.float32)
+        self.interpreter.set_tensor(self.in_idx, data)
+        self.interpreter.invoke()
+        return self.interpreter.get_tensor(self.out_idx)
 
 class FSignRealtimeProcessor:
     """
@@ -102,7 +137,7 @@ class FSignRealtimeProcessor:
     def process_keypoints(self, keypoints_raw: np.ndarray, current_time: float = None) -> dict:
         """
         Xử lý 1 vector keypoints thô (126,) tại thời điểm current_time.
-        Bổ sung telemetry đo thời gian chuẩn hóa (t_norm) và suy luận (t_predict) - Mục C1.
+        Bổ sung telemetry đo thời gian chuẩn hóa (t_norm) và suy luận (t_predict).
         """
         if current_time is None:
             current_time = time.time()
@@ -114,14 +149,12 @@ class FSignRealtimeProcessor:
         is_empty_hand = np.all(keypoints_raw == 0)
 
         # ─── 1. XỬ LÝ TRƯỜNG HỢP MẤT DẤU TAY (EMPTY HAND) ───
-        # Tuyệt đối KHÔNG normalize hay append frame rỗng vào sequence buffer!
         if is_empty_hand:
             if self.empty_hand_start_time is None:
                 self.empty_hand_start_time = current_time
 
             elapsed = current_time - self.empty_hand_start_time
             if elapsed >= self.idle_threshold_sec:
-                # Quá ngưỡng thời gian -> Kích hoạt Idle thật sự, dọn sạch buffer
                 self.is_idle = True
                 self.status_text = f"Dang cho / Idle ({elapsed:.1f}s)"
                 if len(self.sequence) > 0:
@@ -129,7 +162,6 @@ class FSignRealtimeProcessor:
                 if len(self.predictions) > 0:
                     self.predictions.clear()
             else:
-                # Dưới ngưỡng thời gian -> Tạm ngưng (Dropout ngắn), bảo toàn buffer, KHÔNG append frame rỗng
                 self.status_text = f"Tam ngung / Cho tay ({elapsed:.2f}s)"
 
             return {
@@ -145,11 +177,10 @@ class FSignRealtimeProcessor:
             }
 
         # ─── 2. KHI CÓ TAY (NOT EMPTY HAND) ───
-        # Thoát Idle và đặt lại đồng hồ theo dõi rỗng tay
         self.empty_hand_start_time = None
         self.is_idle = False
 
-        # CHỈ chuẩn hóa và đưa vào buffer sequence khi THẬT SỰ CÓ TAY (đo lường t_norm)
+        # CHỈ chuẩn hóa và đưa vào buffer sequence khi THẬT SỰ CÓ TAY
         t0_norm = time.perf_counter()
         keypoints_norm = normalize_keypoints(keypoints_raw)
         t_norm = time.perf_counter() - t0_norm
@@ -161,7 +192,7 @@ class FSignRealtimeProcessor:
         confidence = 0.0
 
         if len(self.sequence) == self.sequence_length:
-            self.status_text = "Dang nhan dien..."
+            self.status_text = "Dang nhan dien (TFLite)..."
             if self.model is not None:
                 self.predict_call_count += 1
                 t0_pred = time.perf_counter()
@@ -173,16 +204,14 @@ class FSignRealtimeProcessor:
                 self.predictions.append(pred_idx)
                 confidence = float(res[pred_idx])
 
-                # Sửa triệt để bug consensus-check cũ của Look & Tell (Mục B3):
-                # Yêu cầu TOÀN BỘ consensus_window frame gần nhất cùng dự đoán ra pred_idx VÀ confidence > threshold
+                # Consensus check (Mục B3)
                 is_consensus = (
                     len(self.predictions) >= self.consensus_window and
                     all(p == pred_idx for p in self.predictions[-self.consensus_window:]) and
                     confidence > self.threshold
                 )
 
-                # Cơ chế Cooldown theo thời gian thực (Mục B4):
-                # Chặn đứng spam nhãn liên tục và cho phép lặp lại từ một cách hợp lệ sau khi hết cooldown
+                # Cooldown theo thời gian thực (Mục B4)
                 if is_consensus:
                     predicted_action = self.actions[pred_idx]
                     elapsed_cooldown = current_time - self.last_action_time
@@ -209,85 +238,22 @@ class FSignRealtimeProcessor:
             'predicted_this_frame': predicted_this_frame
         }
 
-class ThreadedCamera:
-    """
-    Lớp đọc webcam đa luồng (Producer-Consumer pattern) - Mục C3:
-    - Worker daemon thread liên tục chạy cap.read() ở tốc độ tối đa của camera.
-    - Luôn lưu giữ đúng 1 frame mới nhất vào deque(maxlen=1), tự động loại bỏ frame cũ.
-    - Sử dụng threading.Lock khi đọc/ghi để ngăn ngừa race condition tuyệt đối.
-    - Consumer (main thread) gọi .read() lấy frame mới nhất tức thì (non-blocking, tiết kiệm ~8ms).
-    - Dừng sạch (clean shutdown) khi gọi .stop() để tránh zombie thread.
-    """
-    def __init__(self, src=0, custom_cap=None):
-        self.src = src
-        if custom_cap is not None:
-            self.cap = custom_cap
-        else:
-            self.cap = cv2.VideoCapture(self.src)
-
-        self.lock = threading.Lock()
-        self.frame_buffer = deque(maxlen=1)
-        self.stopped = False
-        self.thread = None
-
-        if not self.cap.isOpened():
-            raise RuntimeError(f"[Lỗi] Không thể mở thiết bị camera index {self.src}!")
-
-        # Đọc frame khởi tạo đầu tiên để buffer luôn sẵn sàng ngay từ frame 0
-        ret, initial_frame = self.cap.read()
-        if ret and initial_frame is not None:
-            self.frame_buffer.append(initial_frame)
-
-        # Khởi động worker daemon thread
-        self.thread = threading.Thread(target=self._capture_worker, daemon=True, name="ThreadedCameraWorker")
-        self.thread.start()
-
-    def _capture_worker(self):
-        while not self.stopped:
-            if not self.cap.isOpened():
-                break
-            ret, frame = self.cap.read()
-            if not ret or frame is None:
-                time.sleep(0.002)
-                continue
-            with self.lock:
-                self.frame_buffer.append(frame)
-
-    def read(self):
-        with self.lock:
-            if len(self.frame_buffer) > 0:
-                return True, self.frame_buffer[-1].copy()
-            else:
-                return False, None
-
-    def stop(self):
-        self.stopped = True
-        if self.thread is not None and self.thread.is_alive():
-            self.thread.join(timeout=1.0)
-        if self.cap is not None and self.cap.isOpened():
-            self.cap.release()
-
-    def isOpened(self):
-        return self.cap is not None and self.cap.isOpened()
-
-def run_realtime_detection(model):
+def run_realtime_tflite_detection(model_wrapper, actions):
     processor = FSignRealtimeProcessor(
         actions,
-        model=model,
+        model=model_wrapper,
         idle_threshold_sec=IDLE_TIME_THRESHOLD_SEC,
         consensus_window=CONSENSUS_WINDOW,
         cooldown_sec=COOLDOWN_TIME_SEC,
-        sequence_length=60,
-        threshold=0.5
+        sequence_length=SEQUENCE_LENGTH,
+        threshold=CONFIDENCE_THRESHOLD
     )
 
-    try:
-        cam = ThreadedCamera(src=0)
-    except Exception as e:
-        print(f"[Lỗi] Không thể mở webcam: {e}")
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("[Lỗi] Không thể mở webcam!")
         return
 
-    # Khởi tạo các buffer đo đếm hiệu năng thời gian thực (Mục C3)
     window_size = 30
     fps_history = deque(maxlen=window_size)
     cap_times = deque(maxlen=window_size)
@@ -298,11 +264,11 @@ def run_realtime_detection(model):
     draw_times = deque(maxlen=window_size)
     compute_times = deque(maxlen=window_size)
 
-    log_file_path = "benchmark_c3_threaded_fps.log"
+    log_file_path = "benchmark_c2_realtime_fps.log"
     log_file = open(log_file_path, "w", encoding="utf-8")
     header_info = (
         "=================================================================\n"
-        "=== FSIGN REAL-TIME FPS & LATENCY BENCHMARK — THREADED CAMERA (MỤC C3) ===\n"
+        "=== FSIGN REAL-TIME FPS & LATENCY BENCHMARK — TFLITE ENGINE (MỤC C2) ===\n"
         f"Thời gian bắt đầu: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
         "================================================================="
     )
@@ -313,32 +279,31 @@ def run_realtime_detection(model):
     frame_count = 0
     session_start_time = time.perf_counter()
 
-    print("=> Bắt đầu nhận diện qua webcam (Threaded Camera). Nhấn 'q' trên cửa sổ video để dừng.")
+    print("=> Bắt đầu nhận diện qua webcam với TFLite. Nhấn 'q' trên cửa sổ video để thoát.")
     with mp_hands.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
-        while cam.isOpened():
+        while cap.isOpened():
             t_frame_start = time.perf_counter()
 
-            # 1. Đo thời gian đọc frame từ ThreadedCamera (non-blocking)
+            # 1. Đọc frame từ webcam
             t0 = time.perf_counter()
-            ret, frame = cam.read()
+            ret, frame = cap.read()
             t_cap = time.perf_counter() - t0
-            if not ret or frame is None:
-                time.sleep(0.002)
-                continue
+            if not ret:
+                break
 
-            # 2. Đo thời gian MediaPipe Holistic
+            # 2. MediaPipe Holistic
             t0 = time.perf_counter()
             image, results = mediapipe_detection(frame, holistic)
             t_mp = time.perf_counter() - t0
 
-            # 3. Trích xuất landmark và xử lý qua FSignRealtimeProcessor (đo normalize & predict)
+            # 3. Trích xuất landmark và xử lý qua FSignRealtimeProcessor (TFLite Predict)
             keypoints_raw = extract_keypoints(results)
             res_dict = processor.process_keypoints(keypoints_raw, current_time=time.time())
             t_norm = res_dict['t_norm']
             t_predict = res_dict['t_predict']
             predicted_this_frame = res_dict['predicted_this_frame']
 
-            # 4. Đo thời gian vẽ landmark và render UI OpenCV
+            # 4. Vẽ landmark và render UI OpenCV
             t0_draw = time.perf_counter()
             draw_styled_landmarks(image, results)
 
@@ -349,34 +314,32 @@ def run_realtime_detection(model):
                 cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2, cv2.LINE_AA
             )
 
-            # 4.2. Thanh trạng thái Idle / Cooldown / Nhận diện (ngay dưới banner top)
+            # 4.2. Thanh trạng thái Idle / Cooldown / Nhận diện
             status_color = (0, 165, 255) if res_dict['is_idle'] else (0, 255, 0)
             cv2.putText(
                 image, res_dict['status_text'], (10, 70),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, status_color, 2, cv2.LINE_AA
             )
 
-            # 4.3. Badge hiển thị FPS thời gian thực lên màn hình (góc phải trên)
+            # 4.3. Badge hiển thị FPS thời gian thực & Latency TFLite
             current_fps_display = np.mean(fps_history) if len(fps_history) > 0 else 0.0
+            last_pred_lat = np.mean(predict_times) if len(predict_times) > 0 else 0.0
             cv2.putText(
-                image, f"FPS: {current_fps_display:4.1f}", (480, 70),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2, cv2.LINE_AA
+                image, f"TFLite FPS: {current_fps_display:4.1f} | Lat: {last_pred_lat:4.1f}ms", (320, 70),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA
             )
 
-            cv2.imshow('OpenCV Feed - FSign', image)
+            cv2.imshow('OpenCV Feed - FSign (TFLite Engine)', image)
             t_draw_ui = time.perf_counter() - t0_draw
 
-            # Tổng thời gian tính toán thuần
             t_compute = t_cap + t_mp + t_norm + t_predict + t_draw_ui
 
-            # Lắng nghe phím 'q' để thoát (dùng waitKey(1) cho ứng dụng thời gian thực)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
             t_frame_total = time.perf_counter() - t_frame_start
             instant_fps = 1.0 / max(t_frame_total, 1e-5)
 
-            # Tích lũy vào rolling deque
             frame_count += 1
             fps_history.append(instant_fps)
             cap_times.append(t_cap * 1000.0)
@@ -388,7 +351,7 @@ def run_realtime_detection(model):
             draw_times.append(t_draw_ui * 1000.0)
             compute_times.append(t_compute * 1000.0)
 
-            # ─── IN BÁO CÁO TRUNG BÌNH ĐỘNG MỖI 30 FRAME ───
+            # Báo cáo rolling window mỗi 30 frame
             if frame_count % window_size == 0:
                 mean_fps = np.mean(fps_history)
                 min_fps = np.min(fps_history)
@@ -409,13 +372,13 @@ def run_realtime_detection(model):
                 pct_draw = (mean_draw / mean_compute) * 100 if mean_compute > 0 else 0
 
                 log_block = (
-                    f"\n[FRAME {frame_count:04d}] ─── HIỆU NĂNG THỜI GIAN THỰC (30 FRAMES GẦN NHẤT) ───\n"
+                    f"\n[FRAME {frame_count:04d} - TFLITE] ─── HIỆU NĂNG THỜI GIAN THỰC (30 FRAMES GẦN NHẤT) ───\n"
                     f"  FPS Vòng lặp:   Trung bình: {mean_fps:5.1f} | Min: {min_fps:5.1f} | Max: {max_fps:5.1f}\n"
                     f"  Thời gian trung bình từng bước:\n"
                     f"    - Đọc Webcam (cap.read):            {mean_cap:6.2f} ms ({pct_cap:5.1f}%)\n"
                     f"    - MediaPipe Holistic:              {mean_mp:6.2f} ms ({pct_mp:5.1f}%)\n"
                     f"    - Chuẩn hóa (normalize_keypoints):  {mean_norm:6.2f} ms ({pct_norm:5.1f}%)\n"
-                    f"    - Suy luận LSTM (model.predict):    {mean_pred:6.2f} ms ({pct_pred:5.1f}%) [gọi {predict_count}/{window_size} frames]\n"
+                    f"    - TFLite Predict (Interpreter):     {mean_pred:6.2f} ms ({pct_pred:5.1f}%) [gọi {predict_count}/{window_size} frames]\n"
                     f"    - Vẽ Landmark & OpenCV UI:          {mean_draw:6.2f} ms ({pct_draw:5.1f}%)\n"
                     f"    ─────────────────────────────────────────────────────────────────\n"
                     f"    Tổng thời gian xử lý thuần:         {mean_compute:6.2f} ms / frame (FPS trần lý thuyết: {1000.0/max(mean_compute, 1e-3):.1f})\n"
@@ -428,7 +391,7 @@ def run_realtime_detection(model):
     total_session_sec = time.perf_counter() - session_start_time
     summary_block = (
         f"\n=================================================================\n"
-        f"=== TỔNG KẾT PHIÊN ĐO HIỆU NĂNG REALTIME (MỤC C3 - THREADED CAMERA) ===\n"
+        f"=== TỔNG KẾT PHIÊN ĐO HIỆU NĂNG REALTIME TFLITE (MỤC C2) ===\n"
         f"  Tổng frames đã chạy:    {frame_count}\n"
         f"  Thời gian chạy:         {total_session_sec:.2f} giây\n"
         f"  FPS trung bình toàn bộ: {frame_count / max(total_session_sec, 1e-5):.2f} FPS\n"
@@ -439,40 +402,13 @@ def run_realtime_detection(model):
     log_file.write(summary_block + "\n")
     log_file.close()
 
-    cam.stop()
+    cap.release()
     cv2.destroyAllWindows()
 
-class TFLiteModelWrapper:
-    """
-    Wrapper đóng gói TFLite Interpreter để cung cấp giao diện .predict()
-    tương thích hoàn toàn với tf.keras.Model mà không cần thay đổi bất kỳ logic nghiệp vụ nào.
-    """
-    def __init__(self, model_path, num_threads=4):
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"[Lỗi] Không tìm thấy file model TFLite tại: {model_path}")
-        self.model_path = model_path
-        self.num_threads = num_threads
-        self.interpreter = tf.lite.Interpreter(model_path=model_path, num_threads=num_threads)
-        self.interpreter.allocate_tensors()
-        self.input_details = self.interpreter.get_input_details()
-        self.output_details = self.interpreter.get_output_details()
-        self.in_idx = self.input_details[0]['index']
-        self.out_idx = self.output_details[0]['index']
-
-    def predict(self, input_data: np.ndarray, verbose=0) -> np.ndarray:
-        data = np.asarray(input_data, dtype=np.float32)
-        self.interpreter.set_tensor(self.in_idx, data)
-        self.interpreter.invoke()
-        return self.interpreter.get_tensor(self.out_idx)
-
 if __name__ == '__main__':
-    print("Khởi tạo mô hình FSign Unified (TFLite Engine)...")
-    tflite_model_path = os.path.join('Models', 'model_normalized_v1.tflite')
-    if os.path.exists(tflite_model_path):
-        print(f"Đang tải mô hình TFLite từ: {tflite_model_path}")
-        model = TFLiteModelWrapper(tflite_model_path, num_threads=4)
-        print(f"=> Tải mô hình TFLite thành công cho {len(actions)} nhãn!")
-    else:
-        raise FileNotFoundError(f"[Lỗi] Không tìm thấy file model TFLite tại {tflite_model_path}")
-
-    run_realtime_detection(model)
+    actions = load_actions()
+    tflite_path = os.path.join('Models', 'model_normalized_v1.tflite')
+    
+    # Sử dụng 4 threads cho TFLite trên CPU
+    model_wrapper = TFLiteModelWrapper(tflite_path, num_threads=4)
+    run_realtime_tflite_detection(model_wrapper, actions)

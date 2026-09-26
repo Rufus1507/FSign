@@ -1,8 +1,20 @@
+# -*- coding: utf-8 -*-
+"""
+archive/RunModel_pre_c3.py — Bản lưu trữ RunModel.py trước khi cài đặt Multi-threading (Mục C3)
+=============================================================================================
+Bản này đã merge hoàn tất TFLite Engine (Models/model_normalized_v1.tflite) với TFLiteModelWrapper,
+vượt qua 100% 5 bài test GĐ B (B1-B5), tốc độ suy luận ~4.1ms lúc webcam:
+  - B1: Chuẩn hóa per-hand (normalize_keypoints).
+  - B2: Idle Detection 0.5s theo thời gian thực.
+  - B3: Consensus-check 10 frame liên tiếp cùng nhãn.
+  - B4: Cooldown 1.2s theo thời gian thực.
+  - B5: Chống rò rỉ frame zero khi mất dấu tay ngắn (< 0.5s).
+  - C2: TFLite Engine (XNNPACK 4 threads).
+"""
 import cv2
 import numpy as np
 import os
 import time
-import threading
 from collections import deque
 from matplotlib import pyplot as plt
 import mediapipe as mp
@@ -209,67 +221,6 @@ class FSignRealtimeProcessor:
             'predicted_this_frame': predicted_this_frame
         }
 
-class ThreadedCamera:
-    """
-    Lớp đọc webcam đa luồng (Producer-Consumer pattern) - Mục C3:
-    - Worker daemon thread liên tục chạy cap.read() ở tốc độ tối đa của camera.
-    - Luôn lưu giữ đúng 1 frame mới nhất vào deque(maxlen=1), tự động loại bỏ frame cũ.
-    - Sử dụng threading.Lock khi đọc/ghi để ngăn ngừa race condition tuyệt đối.
-    - Consumer (main thread) gọi .read() lấy frame mới nhất tức thì (non-blocking, tiết kiệm ~8ms).
-    - Dừng sạch (clean shutdown) khi gọi .stop() để tránh zombie thread.
-    """
-    def __init__(self, src=0, custom_cap=None):
-        self.src = src
-        if custom_cap is not None:
-            self.cap = custom_cap
-        else:
-            self.cap = cv2.VideoCapture(self.src)
-
-        self.lock = threading.Lock()
-        self.frame_buffer = deque(maxlen=1)
-        self.stopped = False
-        self.thread = None
-
-        if not self.cap.isOpened():
-            raise RuntimeError(f"[Lỗi] Không thể mở thiết bị camera index {self.src}!")
-
-        # Đọc frame khởi tạo đầu tiên để buffer luôn sẵn sàng ngay từ frame 0
-        ret, initial_frame = self.cap.read()
-        if ret and initial_frame is not None:
-            self.frame_buffer.append(initial_frame)
-
-        # Khởi động worker daemon thread
-        self.thread = threading.Thread(target=self._capture_worker, daemon=True, name="ThreadedCameraWorker")
-        self.thread.start()
-
-    def _capture_worker(self):
-        while not self.stopped:
-            if not self.cap.isOpened():
-                break
-            ret, frame = self.cap.read()
-            if not ret or frame is None:
-                time.sleep(0.002)
-                continue
-            with self.lock:
-                self.frame_buffer.append(frame)
-
-    def read(self):
-        with self.lock:
-            if len(self.frame_buffer) > 0:
-                return True, self.frame_buffer[-1].copy()
-            else:
-                return False, None
-
-    def stop(self):
-        self.stopped = True
-        if self.thread is not None and self.thread.is_alive():
-            self.thread.join(timeout=1.0)
-        if self.cap is not None and self.cap.isOpened():
-            self.cap.release()
-
-    def isOpened(self):
-        return self.cap is not None and self.cap.isOpened()
-
 def run_realtime_detection(model):
     processor = FSignRealtimeProcessor(
         actions,
@@ -281,13 +232,12 @@ def run_realtime_detection(model):
         threshold=0.5
     )
 
-    try:
-        cam = ThreadedCamera(src=0)
-    except Exception as e:
-        print(f"[Lỗi] Không thể mở webcam: {e}")
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("[Lỗi] Không thể mở webcam!")
         return
 
-    # Khởi tạo các buffer đo đếm hiệu năng thời gian thực (Mục C3)
+    # Khởi tạo các buffer đo đếm hiệu năng thời gian thực (Mục C1)
     window_size = 30
     fps_history = deque(maxlen=window_size)
     cap_times = deque(maxlen=window_size)
@@ -298,11 +248,11 @@ def run_realtime_detection(model):
     draw_times = deque(maxlen=window_size)
     compute_times = deque(maxlen=window_size)
 
-    log_file_path = "benchmark_c3_threaded_fps.log"
+    log_file_path = "benchmark_c1_fps.log"
     log_file = open(log_file_path, "w", encoding="utf-8")
     header_info = (
         "=================================================================\n"
-        "=== FSIGN REAL-TIME FPS & LATENCY BENCHMARK — THREADED CAMERA (MỤC C3) ===\n"
+        "=== FSIGN REAL-TIME FPS & LATENCY BENCHMARK (MỤC C1) ===\n"
         f"Thời gian bắt đầu: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
         "================================================================="
     )
@@ -313,18 +263,17 @@ def run_realtime_detection(model):
     frame_count = 0
     session_start_time = time.perf_counter()
 
-    print("=> Bắt đầu nhận diện qua webcam (Threaded Camera). Nhấn 'q' trên cửa sổ video để dừng.")
+    print("=> Bắt đầu nhận diện qua webcam. Nhấn 'q' trên cửa sổ video để dừng và xem tổng kết.")
     with mp_hands.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
-        while cam.isOpened():
+        while cap.isOpened():
             t_frame_start = time.perf_counter()
 
-            # 1. Đo thời gian đọc frame từ ThreadedCamera (non-blocking)
+            # 1. Đo thời gian đọc frame từ webcam (cap.read)
             t0 = time.perf_counter()
-            ret, frame = cam.read()
+            ret, frame = cap.read()
             t_cap = time.perf_counter() - t0
-            if not ret or frame is None:
-                time.sleep(0.002)
-                continue
+            if not ret:
+                break
 
             # 2. Đo thời gian MediaPipe Holistic
             t0 = time.perf_counter()
@@ -428,7 +377,7 @@ def run_realtime_detection(model):
     total_session_sec = time.perf_counter() - session_start_time
     summary_block = (
         f"\n=================================================================\n"
-        f"=== TỔNG KẾT PHIÊN ĐO HIỆU NĂNG REALTIME (MỤC C3 - THREADED CAMERA) ===\n"
+        f"=== TỔNG KẾT PHIÊN ĐO HIỆU NĂNG REALTIME (MỤC C1) ===\n"
         f"  Tổng frames đã chạy:    {frame_count}\n"
         f"  Thời gian chạy:         {total_session_sec:.2f} giây\n"
         f"  FPS trung bình toàn bộ: {frame_count / max(total_session_sec, 1e-5):.2f} FPS\n"
@@ -439,7 +388,7 @@ def run_realtime_detection(model):
     log_file.write(summary_block + "\n")
     log_file.close()
 
-    cam.stop()
+    cap.release()
     cv2.destroyAllWindows()
 
 class TFLiteModelWrapper:

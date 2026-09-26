@@ -130,4 +130,7 @@ tmp_clips/
 *.log
 normalize_run.log
 run_collect_test.py
+Logs/
+**/Logs/
+*.tfevents*
 
