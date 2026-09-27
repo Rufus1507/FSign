@@ -10,7 +10,7 @@ Tính năng:
   - Nạp dữ liệu siêu tốc bằng ThreadPool đa luồng + tự động lưu cache dataset_cache.npz.
   - Tách Train / Validation / Test (Holdout 15%) phân tầng (stratified).
   - Tự động kiểm tra chéo độ khớp 100% giữa model trong RAM và file .h5 lưu trên đĩa.
-  - Đánh giá chi tiết bằng classification_report (đầy đủ 61 nhãn).
+  - Đánh giá chi tiết bằng classification_report (đầy đủ 60 nhãn).
   - Benchmark đối đầu với checkpoint cũ release/94,58.h5 trên cùng tập Test.
   - Thử nghiệm độ bền (robustness test) với các biến đổi tỷ lệ khoảng cách/góc.
 """
@@ -229,7 +229,7 @@ def run_robustness_test(model, X_test, y_test, label_names, scale_factors=[0.7, 
 
 def evaluate_legacy_comparison(new_model, X_test, y_test, label_map, legacy_weights_path='release/94,58.h5'):
     """
-    So sánh đối đầu giữa Model Mới (61 nhãn) và Checkpoint Cũ 94,58.h5 (60 nhãn)
+    So sánh đối đầu giữa Model Mới (60 nhãn) và Checkpoint Cũ 94,58.h5 (60 nhãn)
     trên cùng tập test holdout.
     """
     print("\n" + "="*70)
@@ -242,7 +242,7 @@ def evaluate_legacy_comparison(new_model, X_test, y_test, label_map, legacy_weig
     y_pred_new = new_model.predict(X_test, verbose=0)
     y_pred_new_idx = np.argmax(y_pred_new, axis=1)
     acc_new = accuracy_score(y_test_indices, y_pred_new_idx)
-    print(f"\n=> [1] Model Mới (train trên Data_normalized/ - 61 nhãn):")
+    print(f"\n=> [1] Model Mới (train trên Data_normalized/ - 60 nhãn):")
     print(f"   Accuracy trên toàn bộ tập test: {acc_new * 100:.2f}% ({np.sum(y_pred_new_idx == y_test_indices)}/{len(y_test_indices)} samples)")
 
     if not os.path.exists(legacy_weights_path):
@@ -342,7 +342,7 @@ def main():
 
     # 3. Khởi tạo mô hình kiến trúc chuẩn từ model_def.py
     print("\n[3/5] Khởi tạo mô hình kiến trúc chuẩn nhất quán (Unified LSTM)...")
-    model = build_unified_model(input_shape=(60, 126), num_classes=num_classes, lr=args.lr, clipnorm=1.0)
+    model = build_unified_model(input_shape=(60, 129), num_classes=num_classes, lr=args.lr, clipnorm=1.0)
 
     os.makedirs(os.path.dirname(args.output_model), exist_ok=True)
 
@@ -395,7 +395,14 @@ def main():
     # Kiểm tra chéo đồng nhất RAM vs Đĩa khi vừa train xong
     if not args.eval_only:
         print("--- [KIỂM TRA CHÉO ĐỒNG NHẤT RAM VS ĐĨA] ---")
-        disk_model = build_unified_model(input_shape=(60, 126), num_classes=num_classes, lr=args.lr)
+        disk_model = build_unified_model(input_shape=(60, 129), num_classes=num_classes, lr=args.lr)
+        # Assert chặn cứng kiểm tra chéo (Task C2)
+        assert disk_model.output_shape[-1] == num_classes, (
+            f"Label count mismatch: {num_classes} labels vs {disk_model.output_shape[-1]} model outputs"
+        )
+        assert disk_model.input_shape[-1] == 129, (
+            f"Input feature dimension mismatch: expected 129 features vs {disk_model.input_shape[-1]} model inputs"
+        )
         disk_model.load_weights(args.output_model)
         _, disk_acc = disk_model.evaluate(X_test, y_test, verbose=0)
         print(f"  Model trong RAM:     {test_acc * 100:.4f}%")

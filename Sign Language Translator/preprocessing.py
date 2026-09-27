@@ -27,7 +27,10 @@ mp_drawing = mp.solutions.drawing_utils
 # MediaPipe Hands: 21 landmarks, mỗi landmark 3 chiều (x, y, z)
 # Layout trong vector (126,): [left_hand(63)] + [right_hand(63)]
 _WRIST_IDX = 0        # landmark 0 = WRIST
+_INDEX_MCP_IDX = 5    # landmark 5 = INDEX_FINGER_MCP
+_MIDDLE_MCP_IDX = 9   # landmark 9 = MIDDLE_FINGER_MCP
 _MIDDLE_TIP_IDX = 12  # landmark 12 = MIDDLE_FINGER_TIP
+_PINKY_MCP_IDX = 17   # landmark 17 = PINKY_MCP
 _HAND_DIM = 21 * 3    # 63 chiều mỗi tay
 _EPSILON = 1e-6       # ngưỡng epsilon guard tránh chia cho 0
 
@@ -89,11 +92,11 @@ def _normalize_one_hand(kp_63: np.ndarray) -> np.ndarray:
     """
     Normalize 1 tay (vector 63 chiều = 21 landmark × 3).
 
-    Chiến lược:
+    Chiến lược (Task A4.5 S_combined chốt):
       1. Toàn zeros → tay absent, trả zeros (không xử lý)
-      2. scale = ||middle_tip - wrist|| < epsilon → tọa độ degenerate,
+      2. scale = sqrt(||mcp9 - wrist||^2 + ||mcp17 - mcp5||^2) < epsilon → tọa độ degenerate,
          coi invalid, trả zeros (epsilon guard tránh NaN/Inf)
-      3. Ngược lại: centering quanh wrist + chia cho scale
+      3. Ngược lại: centering quanh wrist + chia cho scale (đường chéo mu bàn tay cố định)
 
     Args:
         kp_63: ndarray shape (63,)
@@ -105,11 +108,18 @@ def _normalize_one_hand(kp_63: np.ndarray) -> np.ndarray:
         return np.zeros(63, dtype=np.float64)
 
     wrist_slice = slice(_WRIST_IDX * 3, _WRIST_IDX * 3 + 3)
-    mid_slice   = slice(_MIDDLE_TIP_IDX * 3, _MIDDLE_TIP_IDX * 3 + 3)
+    mcp9_slice  = slice(_MIDDLE_MCP_IDX * 3, _MIDDLE_MCP_IDX * 3 + 3)
+    mcp5_slice  = slice(_INDEX_MCP_IDX * 3, _INDEX_MCP_IDX * 3 + 3)
+    mcp17_slice = slice(_PINKY_MCP_IDX * 3, _PINKY_MCP_IDX * 3 + 3)
 
-    wrist      = kp_63[wrist_slice].copy()
-    middle_tip = kp_63[mid_slice].copy()
-    scale = float(np.linalg.norm(middle_tip - wrist))
+    wrist = kp_63[wrist_slice].copy()
+    mcp9  = kp_63[mcp9_slice].copy()
+    mcp5  = kp_63[mcp5_slice].copy()
+    mcp17 = kp_63[mcp17_slice].copy()
+
+    d_len_sq = float(np.sum((mcp9 - wrist) ** 2))
+    d_wid_sq = float(np.sum((mcp17 - mcp5) ** 2))
+    scale = float(np.sqrt(d_len_sq + d_wid_sq))
 
     # Guard 2: scale gần 0 (tọa độ degenerate)
     if scale < _EPSILON:
@@ -122,20 +132,52 @@ def _normalize_one_hand(kp_63: np.ndarray) -> np.ndarray:
     return result.flatten()
 
 
-def normalize_keypoints(kp_126: np.ndarray) -> np.ndarray:
+def normalize_keypoints(kp_126: np.ndarray, include_rel_wrist: bool = True, include_presence: bool = False) -> np.ndarray:
     """
     Normalize vector (126,) gồm left_hand(0:63) và right_hand(63:126).
     Áp dụng epsilon guard độc lập cho từng tay.
+    Bổ sung vector tương đối 2 cổ tay (Wrist_RH - Wrist_LH, 3 chiều) -> tổng 129 chiều (Task A5.2).
+    Bổ sung 2 chiều presence flag (LH present, RH present) -> tổng 131 chiều (Task E2).
 
     Args:
         kp_126: ndarray shape (126,) — tọa độ gốc MediaPipe
+        include_rel_wrist: bool — nếu True, nối thêm 3 chiều tương đối (Wrist_RH - Wrist_LH)
+        include_presence: bool — nếu True, nối thêm 2 chiều presence flag [lh_flag, rh_flag] (Task E2)
     Returns:
-        ndarray shape (126,) — đã normalize, không NaN, không Inf
+        ndarray shape (126,), (129,), hoặc (131,)
     """
     assert kp_126.shape == (126,), f"Expected (126,), got {kp_126.shape}"
-    lh_norm = _normalize_one_hand(kp_126[:_HAND_DIM].astype(np.float64))
-    rh_norm = _normalize_one_hand(kp_126[_HAND_DIM:].astype(np.float64))
-    return np.concatenate([lh_norm, rh_norm])
+    raw_lh = kp_126[:_HAND_DIM].astype(np.float64)
+    raw_rh = kp_126[_HAND_DIM:].astype(np.float64)
+
+    lh_norm = _normalize_one_hand(raw_lh)
+    rh_norm = _normalize_one_hand(raw_rh)
+
+    # Presence flags (Task E2): 1.0 nếu scale >= 1e-6 (tay được phát hiện), 0.0 nếu epsilon guard kích hoạt
+    lh_present = not np.all(lh_norm == 0.0)
+    rh_present = not np.all(rh_norm == 0.0)
+
+    if not include_rel_wrist and not include_presence:
+        return np.concatenate([lh_norm, rh_norm])
+
+    # Tính vector tương đối giữa 2 cổ tay ở tọa độ thô: Wrist_RH - Wrist_LH
+    # Chỉ tính khi cả 2 tay cùng xuất hiện; nếu 1 hoặc cả 2 tay absent -> vector 0
+    if include_rel_wrist:
+        if lh_present and rh_present:
+            wrist_lh = raw_lh[:3]
+            wrist_rh = raw_rh[:3]
+            rel_wrist = wrist_rh - wrist_lh
+        else:
+            rel_wrist = np.zeros(3, dtype=np.float64)
+        base = np.concatenate([lh_norm, rh_norm, rel_wrist])
+    else:
+        base = np.concatenate([lh_norm, rh_norm])
+
+    if not include_presence:
+        return base
+
+    presence_flags = np.array([1.0 if lh_present else 0.0, 1.0 if rh_present else 0.0], dtype=np.float64)
+    return np.concatenate([base, presence_flags])
 
 
 # ─── Resampling ───────────────────────────────────────────────────────────────

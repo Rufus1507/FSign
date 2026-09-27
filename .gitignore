@@ -115,8 +115,11 @@ dmypy.json
 .pyre/
 
 # Datasets & Large Binary Files
+Data/
+**/Data/
 Data_normalized/
 **/Data_normalized/
+dataset_cache*.npz
 *.mp4
 *.avi
 *.mkv

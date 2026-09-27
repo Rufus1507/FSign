@@ -1,18 +1,19 @@
 import cv2
 import numpy as np
 import os
+import json
 import time
 import threading
-from collections import deque
+from collections import deque, Counter
 from matplotlib import pyplot as plt
 import mediapipe as mp
 import tensorflow as tf
 from model_def import build_model
 from preprocessing import normalize_keypoints
 
-# Cấu hình thời gian thực
-IDLE_TIME_THRESHOLD_SEC = 0.5  # Ngưỡng thời gian không thấy tay (giây) để coi là Idle
-CONSENSUS_WINDOW = 10          # Số frame liên tiếp cần đồng thuận cùng 1 nhãn (Mục B3)
+# Cấu hình thời gian thực (Mục D3: Tăng Idle Dropout Tolerance lên 0.8s)
+IDLE_TIME_THRESHOLD_SEC = 0.8  # Ngưỡng thời gian không thấy tay (giây) để coi là Idle
+CONSENSUS_WINDOW = 10          # Số frame liên tiếp trong cửa sổ trượt consensus
 COOLDOWN_TIME_SEC = 1.2        # Thời gian cooldown giữa 2 lần chèn từ vào câu (Mục B4)
 
 # Chuyển working directory về thư mục chứa file script
@@ -54,22 +55,35 @@ def extract_keypoints(results):
     rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark]).flatten() if results.right_hand_landmarks else np.zeros(21*3)
     return np.concatenate([lh, rh])
 
-def load_actions(cache_path=os.path.join('Data_normalized', 'dataset_cache.npz'), data_dir='Data_normalized'):
+def load_actions(label_map_path='label_map.json', cache_path=os.path.join('Data_normalized', 'dataset_cache_129d.npz'), data_dir='Data_normalized'):
     """
-    Lấy danh sách 61 nhãn chuẩn đúng thứ tự index lúc train:
-    1. Đọc trực tiếp từ dataset_cache.npz (label_map) để đảm bảo 100% khớp index.
-    2. Fallback duyệt Data_normalized nếu chưa có file cache.
+    Lấy danh sách 60 nhãn chuẩn đúng thứ tự index lúc train:
+    1. Đọc trực tiếp từ label_map.json (chính thức).
+    2. Đọc từ dataset_cache_129d.npz (cache chuẩn 129 chiều).
+    3. Fallback duyệt Data_normalized nếu không có file cache.
     """
+    if os.path.exists(label_map_path):
+        try:
+            with open(label_map_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if 'classes' in data and len(data['classes']) > 0:
+                return np.array(data['classes'])
+        except Exception:
+            pass
     if os.path.exists(cache_path):
-        c = np.load(cache_path, allow_pickle=True)
-        label_map = c['label_map'].item()
-        return np.array([k for k, v in sorted(label_map.items(), key=lambda x: x[1])])
-    elif os.path.exists(data_dir):
-        return np.array(sorted([d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))]))
-    else:
-        raise FileNotFoundError(f"Không tìm thấy nguồn dữ liệu nhãn tại {cache_path} hoặc {data_dir}")
+        try:
+            c = np.load(cache_path, allow_pickle=True)
+            if 'actions' in c and len(c['actions']) > 0:
+                return np.array(c['actions'])
+        except Exception:
+            pass
+    if os.path.exists(data_dir):
+        dirs = sorted([d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))])
+        if len(dirs) > 0:
+            return np.array(dirs)
+    raise FileNotFoundError(f"Không tìm thấy nguồn dữ liệu nhãn hợp lệ tại {label_map_path}, {cache_path}, hoặc {data_dir}")
 
-# Danh sách 61 câu cử chỉ nhận diện chuẩn từ dataset
+# Danh sách 60 câu cử chỉ nhận diện chuẩn từ dataset
 actions = load_actions()
 
 class FSignRealtimeProcessor:
@@ -92,6 +106,7 @@ class FSignRealtimeProcessor:
         self.sequence = []
         self.sentence = []
         self.predictions = []
+        self.confidences = []
 
         self.empty_hand_start_time = None
         self.is_idle = True
@@ -99,10 +114,18 @@ class FSignRealtimeProcessor:
         self.status_text = "Dang cho / Idle"
         self.predict_call_count = 0
 
+        # Cơ chế "Hold last valid frame" khi 1 tay bị mất landmark tạm thời (Task D3)
+        self.last_valid_lh = None
+        self.last_valid_rh = None
+        self.last_lh_time = -100.0
+        self.last_rh_time = -100.0
+        self.hand_hold_timeout_sec = 0.4  # Tối đa 0.4s (12 frames) giữ tư thế tay khi che khuất ngắn hạn
+
     def process_keypoints(self, keypoints_raw: np.ndarray, current_time: float = None) -> dict:
         """
         Xử lý 1 vector keypoints thô (126,) tại thời điểm current_time.
         Bổ sung telemetry đo thời gian chuẩn hóa (t_norm) và suy luận (t_predict) - Mục C1.
+        Tăng Idle Dropout Tolerance lên 0.8s + Hold Last Valid Hand khi che khuất - Mục D3.
         """
         if current_time is None:
             current_time = time.time()
@@ -113,7 +136,7 @@ class FSignRealtimeProcessor:
 
         is_empty_hand = np.all(keypoints_raw == 0)
 
-        # ─── 1. XỬ LÝ TRƯỜNG HỢP MẤT DẤU TAY (EMPTY HAND) ───
+        # ─── 1. XỬ LÝ TRƯỜNG HỢP MẤT DẤU TAY HOÀN TOÀN CẢ 2 TAY (EMPTY HAND) ───
         # Tuyệt đối KHÔNG normalize hay append frame rỗng vào sequence buffer!
         if is_empty_hand:
             if self.empty_hand_start_time is None:
@@ -121,13 +144,17 @@ class FSignRealtimeProcessor:
 
             elapsed = current_time - self.empty_hand_start_time
             if elapsed >= self.idle_threshold_sec:
-                # Quá ngưỡng thời gian -> Kích hoạt Idle thật sự, dọn sạch buffer
+                # Quá ngưỡng thời gian (0.8s) -> Kích hoạt Idle thật sự, dọn sạch buffer
                 self.is_idle = True
                 self.status_text = f"Dang cho / Idle ({elapsed:.1f}s)"
                 if len(self.sequence) > 0:
                     self.sequence.clear()
                 if len(self.predictions) > 0:
                     self.predictions.clear()
+                if len(self.confidences) > 0:
+                    self.confidences.clear()
+                self.last_valid_lh = None
+                self.last_valid_rh = None
             else:
                 # Dưới ngưỡng thời gian -> Tạm ngưng (Dropout ngắn), bảo toàn buffer, KHÔNG append frame rỗng
                 self.status_text = f"Tam ngung / Cho tay ({elapsed:.2f}s)"
@@ -136,6 +163,7 @@ class FSignRealtimeProcessor:
                 'is_idle': self.is_idle,
                 'status_text': self.status_text,
                 'predicted_action': None,
+                'emitted_word': None,
                 'confidence': 0.0,
                 'sentence': list(self.sentence),
                 'buffer_len': len(self.sequence),
@@ -144,14 +172,36 @@ class FSignRealtimeProcessor:
                 'predicted_this_frame': predicted_this_frame
             }
 
-        # ─── 2. KHI CÓ TAY (NOT EMPTY HAND) ───
-        # Thoát Idle và đặt lại đồng hồ theo dõi rỗng tay
+        # ─── 2. KHI CÓ ÍT NHẤT 1 TAY HOẠT ĐỘNG (NOT EMPTY HAND) ───
         self.empty_hand_start_time = None
         self.is_idle = False
 
-        # CHỈ chuẩn hóa và đưa vào buffer sequence khi THẬT SỰ CÓ TAY (đo lường t_norm)
+        # Cơ chế "Hold last valid frame" khi 1 tay bị mất landmark tạm thời (Task D3):
+        # Giữ lại landmark tay bị che khuất ngắn hạn (<0.4s) thay vì để trống toàn 0
+        lh = keypoints_raw[:63].copy()
+        rh = keypoints_raw[63:].copy()
+        lh_zero = np.all(lh == 0)
+        rh_zero = np.all(rh == 0)
+
+        # Cập nhật hoặc bù đắp tay trái
+        if not lh_zero:
+            self.last_valid_lh = lh.copy()
+            self.last_lh_time = current_time
+        elif self.last_valid_lh is not None and (current_time - self.last_lh_time) < self.hand_hold_timeout_sec:
+            lh = self.last_valid_lh.copy()
+
+        # Cập nhật hoặc bù đắp tay phải
+        if not rh_zero:
+            self.last_valid_rh = rh.copy()
+            self.last_rh_time = current_time
+        elif self.last_valid_rh is not None and (current_time - self.last_rh_time) < self.hand_hold_timeout_sec:
+            rh = self.last_valid_rh.copy()
+
+        effective_keypoints_raw = np.concatenate([lh, rh])
+
+        # Chuẩn hóa và đưa vào buffer sequence
         t0_norm = time.perf_counter()
-        keypoints_norm = normalize_keypoints(keypoints_raw)
+        keypoints_norm = normalize_keypoints(effective_keypoints_raw)
         t_norm = time.perf_counter() - t0_norm
 
         self.sequence.append(keypoints_norm)
@@ -159,6 +209,7 @@ class FSignRealtimeProcessor:
 
         predicted_action = None
         confidence = 0.0
+        emitted_word = None
 
         if len(self.sequence) == self.sequence_length:
             self.status_text = "Dang nhan dien..."
@@ -170,23 +221,34 @@ class FSignRealtimeProcessor:
                 predicted_this_frame = True
 
                 pred_idx = np.argmax(res)
-                self.predictions.append(pred_idx)
                 confidence = float(res[pred_idx])
+                self.predictions.append(pred_idx)
+                self.confidences.append(confidence)
 
-                # Sửa triệt để bug consensus-check cũ của Look & Tell (Mục B3):
-                # Yêu cầu TOÀN BỘ consensus_window frame gần nhất cùng dự đoán ra pred_idx VÀ confidence > threshold
-                is_consensus = (
-                    len(self.predictions) >= self.consensus_window and
-                    all(p == pred_idx for p in self.predictions[-self.consensus_window:]) and
-                    confidence > self.threshold
-                )
+                # ─── TRIỂN KHAI CHÍNH THỨC BIẾN THỂ 1 (MAJORITY VOTE >= 8/10 + CONF TB > 0.5) ───
+                # Thay thế triệt để consensus 100% bằng Majority Vote nhằm giải phóng "đứng hình" (Task D3)
+                is_consensus = False
+                candidate_idx = None
+
+                if len(self.predictions) >= self.consensus_window:
+                    window_preds = self.predictions[-self.consensus_window:]
+                    window_confs = self.confidences[-self.consensus_window:]
+                    c = Counter(window_preds)
+                    top_idx, count = c.most_common(1)[0]
+                    if count >= 8:
+                        matched_confs = [window_confs[i] for i in range(self.consensus_window) if window_preds[i] == top_idx]
+                        mean_conf = float(np.mean(matched_confs))
+                        if mean_conf > self.threshold:
+                            is_consensus = True
+                            candidate_idx = top_idx
 
                 # Cơ chế Cooldown theo thời gian thực (Mục B4):
-                # Chặn đứng spam nhãn liên tục và cho phép lặp lại từ một cách hợp lệ sau khi hết cooldown
-                if is_consensus:
-                    predicted_action = self.actions[pred_idx]
+                emitted_word = None
+                if is_consensus and candidate_idx is not None:
+                    predicted_action = self.actions[candidate_idx]
                     elapsed_cooldown = current_time - self.last_action_time
                     if elapsed_cooldown >= self.cooldown_sec:
+                        emitted_word = predicted_action
                         self.sentence.append(predicted_action)
                         self.last_action_time = current_time
                     else:
@@ -201,6 +263,7 @@ class FSignRealtimeProcessor:
             'is_idle': self.is_idle,
             'status_text': self.status_text,
             'predicted_action': predicted_action,
+            'emitted_word': emitted_word,
             'confidence': confidence,
             'sentence': list(self.sentence),
             'buffer_len': len(self.sequence),
@@ -458,6 +521,10 @@ class TFLiteModelWrapper:
         self.output_details = self.interpreter.get_output_details()
         self.in_idx = self.input_details[0]['index']
         self.out_idx = self.output_details[0]['index']
+        self.input_shape = self.input_details[0]['shape']
+        self.output_shape = self.output_details[0]['shape']
+        self.input_dim = int(self.input_shape[-1])
+        self.output_dim = int(self.output_shape[-1])
 
     def predict(self, input_data: np.ndarray, verbose=0) -> np.ndarray:
         data = np.asarray(input_data, dtype=np.float32)
@@ -467,11 +534,30 @@ class TFLiteModelWrapper:
 
 if __name__ == '__main__':
     print("Khởi tạo mô hình FSign Unified (TFLite Engine)...")
-    tflite_model_path = os.path.join('Models', 'model_normalized_v1.tflite')
+    # Trỏ chính xác sang model V2 Tanh (128->64->32) 60 lớp 129 chiều thắng ở Hạng mục B
+    tflite_model_path = os.path.join('Models', 'model_b3_v2_descending.tflite')
+    if not os.path.exists(tflite_model_path):
+        # Fallback thử bản v1 nếu chưa convert
+        tflite_model_path = os.path.join('Models', 'model_normalized_v1.tflite')
+
     if os.path.exists(tflite_model_path):
         print(f"Đang tải mô hình TFLite từ: {tflite_model_path}")
         model = TFLiteModelWrapper(tflite_model_path, num_threads=4)
-        print(f"=> Tải mô hình TFLite thành công cho {len(actions)} nhãn!")
+
+        # ─── ASSERT CHẶN CỨNG KIỂM TRA CHÉO (TASK C2) ────────────────────────
+        model_input_dim = int(model.input_details[0]['shape'][-1])
+        model_output_dim = int(model.output_details[0]['shape'][-1])
+        expected_feature_dim = 129  # 126 landmark chuẩn hóa S_combined + 3 relative wrist
+
+        assert model_input_dim == expected_feature_dim, (
+            f"Input feature dimension mismatch: expected {expected_feature_dim} features "
+            f"(126 normalized S_combined + 3 relative wrist), but model expects {model_input_dim}"
+        )
+        assert len(actions) == model_output_dim, (
+            f"Label count mismatch: {len(actions)} labels vs {model_output_dim} model outputs"
+        )
+        print(f"=> Xác thực thành công: Input Dim = {model_input_dim} (129), Số nhãn = {len(actions)} ({model_output_dim}) - KHỚP 100%!")
+        print(f"=> Tải mô hình TFLite sẵn sàng cho {len(actions)} nhãn!")
     else:
         raise FileNotFoundError(f"[Lỗi] Không tìm thấy file model TFLite tại {tflite_model_path}")
 

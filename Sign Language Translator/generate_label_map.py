@@ -32,6 +32,7 @@ OLD_TO_VIETNAMESE_ACCENT = {
     'bo me toi cung la nguoi Diec': 'Bố mẹ tôi cũng là người Điếc',
     'cai nay bao nhieu tien': 'Cái này bao nhiêu tiền?',
     'cai nay la cai gi': 'Cái này là cái gì?',
+    'cam on': 'Cảm ơn',
     'cap cuu': 'Cấp cứu',
     'chuc mung': 'Chúc mừng',
     'chung toi giao tiep voi nhau bang ngon ngu ky hieu': 'Chúng tôi giao tiếp với nhau bằng ngôn ngữ ký hiệu',
@@ -83,11 +84,8 @@ OLD_TO_VIETNAMESE_ACCENT = {
 
 def build_label_map(data_dir):
     data_path = Path(data_dir)
-    # Lấy danh sách tất cả các thư mục nhãn trong Data/
+    # Lấy danh sách tất cả các thư mục nhãn trong Data/ (hoặc Data_normalized/)
     folder_names = sorted([d.name for d in data_path.iterdir() if d.is_dir()])
-    
-    # Loại bỏ 'cam on' nếu còn sót lại (đã thay bằng 'Cam on')
-    folder_names = [f for f in folder_names if f != 'cam on']
 
     id_to_label = {}
     label_to_id = {}
