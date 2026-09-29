@@ -119,6 +119,10 @@ Data/
 **/Data/
 Data_normalized/
 **/Data_normalized/
+Data_normalized_merged119/
+**/Data_normalized_merged119/
+dataset/
+**/dataset/
 dataset_cache*.npz
 *.mp4
 *.avi

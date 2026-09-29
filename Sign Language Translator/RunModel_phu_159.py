@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 
 """
 
@@ -58,30 +58,13 @@ if hasattr(sys.stderr, 'reconfigure'):
 
 
 
-# ΓöÇΓöÇ Protobuf Compatibility Shim cho MediaPipe tr├¬n Windows ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
-
-os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'python'
-
+# ── Protobuf Compatibility Shim ──────────────────────────────────────────
 try:
-
-    from google.protobuf import descriptor, symbol_database
-
     import google.protobuf.message_factory as mf
-
-
-
-    if not hasattr(descriptor.FieldDescriptor, 'label'):
-
-        descriptor.FieldDescriptor.label = property(lambda self: getattr(self, '_label', 1))
-
-
-
     if not hasattr(mf, 'GetMessageClass'):
-
-        mf.GetMessageClass = lambda desc: symbol_database.Default().GetPrototype(desc)
-
+        _factory = mf.MessageFactory()
+        mf.GetMessageClass = _factory.GetPrototype
 except Exception:
-
     pass
 
 
@@ -780,113 +763,98 @@ def load_fsign_model_and_labels():
 
     """
 
+    models_dir = SCRIPT_DIR / 'Models'
     release_dir = SCRIPT_DIR / 'release'
 
-    model_159_path = release_dir / 'fsign_159classes.h5'
+    model_159_path = models_dir / 'fsign_159classes.h5'
+    if not model_159_path.exists():
+        model_159_path = release_dir / 'fsign_159classes.h5'
 
-    model_legacy_path = release_dir / '94,58.h5'
-
-    label_map_path = release_dir / 'label_map.json'
-
-
-
+    label_map_path = models_dir / 'label_map_159.json'
     if not label_map_path.exists():
-
+        label_map_path = release_dir / 'label_map.json'
+    if not label_map_path.exists():
         label_map_path = SCRIPT_DIR / 'label_map.json'
 
-
-
-    # 1. Tß║úi label map
-
+    # 1. Tải label map
     actions_map = {}
-
     if label_map_path.exists():
-
         with open(label_map_path, 'r', encoding='utf-8') as f:
-
             data = json.load(f)
-
             if 'id_to_display' in data:
-
                 actions_map = {int(k): v for k, v in data['id_to_display'].items()}
-
             elif 'id_to_label' in data:
-
                 actions_map = {int(k): v for k, v in data['id_to_label'].items()}
-
             elif 'classes' in data:
-
                 actions_map = {i: c for i, c in enumerate(data['classes'])}
 
-
-
-    # 2. Tß║úi model
-
-    selected_model_path = model_159_path if model_159_path.exists() else model_legacy_path
-
+    # 2. Tải model
+    selected_model_path = model_159_path
     if not selected_model_path.exists():
-
-        all_h5 = list(SCRIPT_DIR.glob('**/*.h5'))
-
+        all_h5 = list(models_dir.glob('**/*.h5')) or list(SCRIPT_DIR.glob('**/*.h5'))
         if all_h5:
-
             selected_model_path = all_h5[0]
-
         else:
+            raise FileNotFoundError("Không tìm thấy bất kỳ file model .h5 nào trong dự án!")
 
-            raise FileNotFoundError("Kh├┤ng t├¼m thß║Ñy bß║Ñt kß╗│ file model .h5 n├áo trong dß╗▒ ├ín!")
-
-
-
-    print(f"=> ─Éang tß║úi model tß╗½: {selected_model_path}...")
-
+    print(f"=> Đang tải model từ: {selected_model_path}...")
+    model = None
     try:
-
         model = load_model(str(selected_model_path), compile=False)
-
     except Exception as e:
+        print(f"  [Thông báo] load_model trực tiếp gặp lỗi tương thích ({e})")
+        print("  => Đang tự động giải mã cấu trúc model từ metadata H5 (Keras 3 -> Keras 2 adapter)...")
+        import h5py
+        from keras.models import model_from_json
 
-        print(f"  [Cß║únh b├ío] load_model gß║╖p lß╗ùi ({e}), ─æang dß╗▒ng cß║Ñu tr├║c v├á nß║íp weights...")
+        try:
+            with h5py.File(str(selected_model_path), 'r') as f:
+                if 'model_config' in f.attrs:
+                    raw_cfg = f.attrs['model_config']
+                    if isinstance(raw_cfg, bytes):
+                        raw_cfg = raw_cfg.decode('utf-8')
+                    # Tương thích ngược Keras 3 sang Keras 2 (tf.keras)
+                    raw_cfg = raw_cfg.replace('"batch_shape":', '"batch_input_shape":')
+                    raw_cfg = raw_cfg.replace(', "optional": false', '')
+                    raw_cfg = raw_cfg.replace('"optional": false,', '')
+                    raw_cfg = raw_cfg.replace('"optional": false', '')
+                    model = model_from_json(raw_cfg)
+                    model.load_weights(str(selected_model_path))
+                    print("  [+] Đã tải cấu trúc và weights thành công qua H5 Metadata Adapter!")
+        except Exception as e2:
+            print(f"  [Adapter Error]: {e2}")
 
-        num_classes = len(actions_map) if actions_map else 159
+        if model is None:
+            # Thử nạp theo kiến trúc FSign-159 Optimized (tanh + BatchNorm)
+            try:
+                from train_fsign159_optimized import build_optimized_model
+                num_classes = len(actions_map) if actions_map else 159
+                model = build_optimized_model(input_shape=(SEQUENCE_LENGTH, FEATURE_DIM), num_classes=num_classes)
+                model.load_weights(str(selected_model_path))
+                print("  [+] Đã nạp thành công theo kiến trúc FSign-159 Optimized (tanh + BatchNorm)!")
+            except Exception as e3:
+                print(f"  [Optimized architecture mismatch]: {e3}")
 
-        model = Sequential([
-
-            Input(shape=(SEQUENCE_LENGTH, FEATURE_DIM)),
-
-            LSTM(64, return_sequences=True, activation='relu'),
-
-            LSTM(128, return_sequences=True, activation='relu'),
-
-            LSTM(64, return_sequences=False, activation='relu'),
-
-            Dense(64, activation='relu'),
-
-            Dropout(0.2),
-
-            Dense(32, activation='relu'),
-
-            Dense(num_classes, activation='softmax')
-
-        ])
-
-        model.load_weights(str(selected_model_path))
-
-
+        if model is None:
+            # Thử nạp theo kiến trúc FSign-159 DeepLSTM (relu)
+            try:
+                from train_fsign159 import build_fsign159_model
+                num_classes = len(actions_map) if actions_map else 159
+                model = build_fsign159_model(input_shape=(SEQUENCE_LENGTH, FEATURE_DIM), num_classes=num_classes)
+                model.load_weights(str(selected_model_path))
+                print("  [+] Đã nạp thành công theo kiến trúc FSign-159 DeepLSTM (relu)!")
+            except Exception as e4:
+                raise RuntimeError(f"Không thể nạp weights vào bất kỳ kiến trúc nào: {e4}")
 
     num_out = model.output_shape[-1]
+    print(f"=> Tải model thành công! Số classes output: {num_out}")
+    print(f"=> Số nhãn trong từ điển: {len(actions_map)}")
 
-    print(f"=> Tß║úi model th├ánh c├┤ng! Sß╗æ classes output: {num_out}")
-
-    print(f"=> Sß╗æ nh├ún trong tß╗½ ─æiß╗ân: {len(actions_map)}")
-
-
-
-        # Assert chặn cứng kiểm tra chéo (Task C2)
+    # Assert kiểm tra chéo
     model_out_dim = getattr(model, 'output_shape', [None, None])[-1]
     if model_out_dim is not None:
-        assert len(actions) == model_out_dim, (
-            f"Label count mismatch: {len(actions)} labels vs {model_out_dim} model outputs"
+        assert len(actions_map) == model_out_dim, (
+            f"Label count mismatch: {len(actions_map)} labels vs {model_out_dim} model outputs"
         )
     return model, actions_map
 

@@ -168,9 +168,18 @@ def main():
     script_dir = Path(__file__).resolve().parent
     base_dir = script_dir.parent
     data_dir = script_dir / 'Data'
+    models_dir = script_dir / 'Models'
     release_dir = script_dir / 'release'
-    model_path = release_dir / 'fsign_159classes.h5'
-    label_map_path = release_dir / 'label_map.json'
+
+    model_path = models_dir / 'fsign_159classes.h5'
+    if not model_path.exists():
+        model_path = release_dir / 'fsign_159classes.h5'
+
+    label_map_path = models_dir / 'label_map_159.json'
+    if not label_map_path.exists():
+        label_map_path = release_dir / 'label_map.json'
+    if not label_map_path.exists():
+        label_map_path = script_dir / 'label_map.json'
 
     output_path = Path(args.output) if args.output else base_dir / 'model_evaluation_report.md'
 
